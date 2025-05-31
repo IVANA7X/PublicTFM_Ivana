@@ -1,0 +1,430 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Script para realizar fine-tuning de un modelo CLIP con Sentence Transformers
+para un dataset de pares de imágenes y texto, con evaluación específica por descriptor,
+usando MultipleNegativesRankingLoss.
+"""
+
+import os
+import pandas as pd
+import torch
+from PIL import Image
+from tqdm.auto import tqdm
+from datasets import DatasetDict, Dataset
+from sentence_transformers import SentenceTransformer, models, losses, InputExample, evaluation, util
+from torch.utils.data import DataLoader
+import wandb
+from sentence_transformers.evaluation import InformationRetrievalEvaluator, SimilarityFunction
+
+# --- Configuración ---
+BATCH_SIZE = 32 # Considera aumentarlo para MNRL si tu GPU lo permite (e.g., 32, 64)
+NUM_EPOCHS = 20
+MODEL_NAME = "clip-ViT-L-14"
+LEARNING_RATE = 1e-5
+# Ya no se necesita CONTRASTIVE_MARGIN para MNRL
+
+IMAGE_BASE_PATH = "/content/dataset_finetuning/content/drive/MyDrive/TFM/dataset_finetuning/"
+# NUEVO: Ruta para el modelo con MNRL
+OUTPUT_PATH_NEW = "./sentence-transformer-finetuned-model-mnrl-test2"
+
+TRAIN_CSV = '/content/drive/MyDrive/TFM/dataset/train_cat.csv'
+VAL_CSV = '/content/drive/MyDrive/TFM/dataset/val_cat.csv'
+TEST_CSV = '/content/drive/MyDrive/TFM/dataset/test_cat.csv'
+
+
+def load_image(path):
+    """Carga una imagen desde la ruta especificada."""
+    try:
+        return Image.open(path).convert('RGB')
+    except Exception as e:
+        print(f"Error al cargar la imagen {path}: {e}")
+        return Image.new('RGB', (224, 224), color=0)
+
+def load_datasets(train_csv, val_csv, test_csv):
+    """Carga los datasets desde archivos CSV."""
+    print("Cargando datasets...")
+    try:
+        df_train = pd.read_csv(train_csv)
+        df_val = pd.read_csv(val_csv)
+        df_test = pd.read_csv(test_csv)
+    except FileNotFoundError as e:
+        print(f"Error: No se pudo encontrar uno de los archivos CSV: {e}")
+        raise
+    except Exception as e:
+        print(f"Error cargando los CSVs: {e}")
+        raise
+
+    train_ds = Dataset.from_pandas(df_train)
+    val_ds = Dataset.from_pandas(df_val)
+    test_ds = Dataset.from_pandas(df_test)
+
+    dataset_dict = DatasetDict({
+        'train': train_ds,
+        'valid': val_ds,
+        'test': test_ds
+    })
+
+    print(f"Dataset de entrenamiento: {len(dataset_dict['train'])} ejemplos")
+    print(f"Dataset de validación: {len(dataset_dict['valid'])} ejemplos")
+    print(f"Dataset de prueba: {len(dataset_dict['test'])} ejemplos")
+    return dataset_dict
+
+# MODIFICADO: Para MNRL, solo necesitamos pares positivos para el entrenamiento.
+# Para evaluación (como EmbeddingSimilarityEvaluator), podemos necesitar todos.
+def create_training_examples(dataset, image_base_path, positive_pairs_only=False, for_evaluation=False):
+    """
+    Crea ejemplos a partir de un dataset.
+    Si positive_pairs_only es True (para entrenamiento MNRL), solo incluye pares con similarity == 1.0.
+    Si for_evaluation es True, usa el score de similitud original como etiqueta.
+    """
+    examples = []
+    num_skipped_negative = 0
+    num_total = 0
+
+    for item in tqdm(dataset, desc="Creando ejemplos"):
+        num_total +=1
+        image_filename = item['image_path']
+        full_image_path = os.path.join(image_base_path, image_filename)
+        caption = item['caption']
+        original_similarity_score = float(item['similarity'])
+
+        if not os.path.exists(full_image_path):
+            print(f"Advertencia: La imagen {full_image_path} no existe. Saltando ejemplo.")
+            continue
+
+        if positive_pairs_only:
+            if original_similarity_score == 1.0:
+                # Para MNRL, la etiqueta no se usa explícitamente de la misma manera,
+                # pero podemos establecerla en 1.0. InputExample(texts=[anchor, positive])
+                examples.append(InputExample(texts=[caption, full_image_path], label=1.0))
+            else:
+                num_skipped_negative += 1
+                continue # Saltar pares no positivos para el entrenamiento MNRL
+        else: # Para evaluación o otras losses
+            label_to_use = original_similarity_score # Usar el score original para evaluadores
+            examples.append(InputExample(texts=[caption, full_image_path], label=label_to_use))
+
+    if positive_pairs_only:
+        print(f"Para MNRL (positive_pairs_only=True): Se incluyeron {len(examples)} pares positivos.")
+        print(f"Se omitieron {num_skipped_negative} de {num_total} ejemplos por no ser positivos (similarity != 1.0).")
+    return examples
+
+
+def prepare_retrieval_eval_data(dataset, image_base_path):
+    """Prepara los datos para InformationRetrievalEvaluator."""
+    queries = {}
+    corpus = {}
+    relevant_docs = {}
+    corpus_id_counter = 0
+    filename_to_corpus_id = {}
+    df_dataset = dataset.to_pandas()
+
+    for index, item in df_dataset.iterrows():
+        image_filename = item['image_path']
+        full_image_path = os.path.join(image_base_path, image_filename)
+        if full_image_path not in filename_to_corpus_id:
+            current_corpus_id = str(corpus_id_counter)
+            filename_to_corpus_id[full_image_path] = current_corpus_id
+            corpus[current_corpus_id] = full_image_path
+            corpus_id_counter += 1
+
+    query_id_counter = 0
+    # Filtrar por similarity >= 1.0 para queries y relevant_docs
+    positive_pairs_df = df_dataset[df_dataset['similarity'] >= 1.0]
+
+    for index, item in positive_pairs_df.iterrows():
+        caption = item['caption']
+        image_filename = item['image_path']
+        full_image_path = os.path.join(image_base_path, image_filename)
+        current_query_id = str(query_id_counter) # Usar un contador para IDs únicos de query
+        queries[current_query_id] = caption
+
+        if full_image_path in filename_to_corpus_id:
+            relevant_corpus_id = filename_to_corpus_id[full_image_path]
+            if current_query_id not in relevant_docs:
+                relevant_docs[current_query_id] = set()
+            relevant_docs[current_query_id].add(relevant_corpus_id)
+        query_id_counter += 1
+
+
+    print(f"Preparado {len(queries)} queries y {len(corpus)} items de corpus para InformationRetrievalEvaluator.")
+    if not queries or not corpus or not relevant_docs:
+        print("ADVERTENCIA: Queries, corpus o relevant_docs están vacíos. La evaluación de recuperación podría no funcionar.")
+    return queries, corpus, relevant_docs
+
+
+# MODIFICADO: Cambiar a MultipleNegativesRankingLoss
+def train_model(model, train_examples, dev_evaluator, num_epochs, learning_rate, output_path):
+    """Entrena el modelo CLIP con Sentence Transformers usando MultipleNegativesRankingLoss."""
+    print(f"Configurando entrenamiento con LR: {learning_rate}, Loss: MultipleNegativesRankingLoss...")
+
+    if not train_examples:
+        print("No hay ejemplos de entrenamiento para MNRL. Saltando el entrenamiento.")
+        return model
+
+    # MultipleNegativesRankingLoss espera solo pares positivos.
+    # Los InputExamples deben ser solo de la forma InputExample(texts=[anchor, positive_example])
+    train_loss = losses.MultipleNegativesRankingLoss(model=model)
+
+    warmup_steps = int(len(train_examples) * num_epochs * 0.1 / BATCH_SIZE) if train_examples else 0
+    # El DataLoader para MNRL debe tener shuffle=True
+    train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=BATCH_SIZE)
+
+    print(f"Iniciando entrenamiento por {num_epochs} épocas con MNRL...")
+    model.fit(
+        train_objectives=[(train_dataloader, train_loss)],
+        evaluator=dev_evaluator,
+        epochs=num_epochs,
+        warmup_steps=warmup_steps,
+        optimizer_params={'lr': learning_rate},
+        output_path=output_path,
+        show_progress_bar=True,
+        evaluation_steps=int(len(train_dataloader) * 0.1) if train_dataloader and len(train_dataloader) > 0 else 100
+    )
+    print(f"Entrenamiento completado. Modelo guardado en {output_path}")
+    return model
+
+
+def evaluate_embedding_similarity(model, examples_for_eval, name='eval'):
+    print(f"Evaluando similitud de embeddings en el conjunto '{name}'...")
+    evaluator = evaluation.EmbeddingSimilarityEvaluator(
+        sentences1=[example.texts[0] for example in examples_for_eval],
+        sentences2=[example.texts[1] for example in examples_for_eval],
+        scores=[example.label for example in examples_for_eval],
+        name=name,
+        show_progress_bar=True
+    )
+    score = evaluator(model)
+    if isinstance(score, dict):
+        for metric_name, metric_value in score.items():
+            print(f"   {name}_{metric_name}: {metric_value:.4f}")
+            if wandb.run: wandb.summary[f"{name}_{metric_name}"] = metric_value
+    else:
+        print(f"   Puntuación de similitud en '{name}': {score:.4f}")
+        if wandb.run: wandb.summary[f"{name}_similarity_score"] = score
+    return score
+
+
+def evaluate_descriptor_specific_recall(model, val_df_pandas, image_base_path, k_values=[1, 3, 5, 10, 20]):
+    print("\n--- Iniciando Evaluación de Recall@k Específico por Descriptor ---")
+    print("Pre-calculando embeddings para queries y corpus de validación...")
+    corpus_image_data = []
+    for filename, group in val_df_pandas.groupby('image_path'):
+        descriptor = group['descriptor'].iloc[0]
+        full_path = os.path.join(image_base_path, filename)
+        corpus_image_data.append({'filename': filename, 'descriptor': descriptor, 'full_path': full_path})
+
+    if not corpus_image_data:
+        print("Corpus de validación vacío para evaluación por descriptor. Saltando.")
+        return {}
+    all_corpus_full_paths = [item['full_path'] for item in corpus_image_data]
+    all_corpus_embeddings = model.encode(all_corpus_full_paths, batch_size=BATCH_SIZE, convert_to_tensor=True, show_progress_bar=True)
+    for i, item in enumerate(corpus_image_data):
+        item['embedding'] = all_corpus_embeddings[i]
+
+    queries_data = []
+    df_val_positive = val_df_pandas[val_df_pandas['similarity'] == 1.0] # Solo captions de pares positivos como queries
+    for index, row in df_val_positive.iterrows():
+        queries_data.append({
+            'text': row['caption'],
+            'descriptor': row['descriptor'],
+            'relevant_image_filename': row['image_path']
+        })
+
+    if not queries_data:
+        print("No hay queries positivas en el conjunto de validación para evaluación por descriptor. Saltando.")
+        return {}
+    all_query_texts = [item['text'] for item in queries_data]
+    all_query_embeddings = model.encode(all_query_texts, batch_size=BATCH_SIZE, convert_to_tensor=True, show_progress_bar=True)
+    for i, item in enumerate(queries_data):
+        item['embedding'] = all_query_embeddings[i]
+
+    print(f"Embeddings calculados: {len(corpus_image_data)} imágenes en corpus, {len(queries_data)} queries.")
+    recall_hits_per_descriptor = {desc: {k: 0 for k in k_values} for desc in val_df_pandas['descriptor'].unique()}
+    query_counts_per_descriptor = {desc: 0 for desc in val_df_pandas['descriptor'].unique()}
+
+    for query_item in tqdm(queries_data, desc="Evaluando queries por descriptor"):
+        query_embedding = query_item['embedding']
+        query_descriptor = query_item['descriptor']
+        true_relevant_filename = query_item['relevant_image_filename']
+        query_counts_per_descriptor[query_descriptor] += 1
+        current_descriptor_corpus_filtered = [img_data for img_data in corpus_image_data if img_data['descriptor'] == query_descriptor]
+
+        if not current_descriptor_corpus_filtered: continue
+        current_corpus_embeddings_tensor = torch.stack([item['embedding'] for item in current_descriptor_corpus_filtered])
+        current_corpus_filenames = [item['filename'] for item in current_descriptor_corpus_filtered]
+        similarities = util.cos_sim(query_embedding.unsqueeze(0), current_corpus_embeddings_tensor)[0]
+        ranked_indices = torch.argsort(similarities, descending=True)
+
+        for k in k_values:
+            top_k_filenames = [current_corpus_filenames[idx.item()] for idx in ranked_indices[:k]]
+            if true_relevant_filename in top_k_filenames:
+                recall_hits_per_descriptor[query_descriptor][k] += 1
+
+    final_recall_scores = {}
+    print("\nResultados de Recall@k Específico por Descriptor (Validation):")
+    for descriptor, k_hits_map in recall_hits_per_descriptor.items():
+        final_recall_scores[descriptor] = {}
+        if query_counts_per_descriptor.get(descriptor, 0) > 0:
+            print(f"   Descriptor: {descriptor} (Consultas: {query_counts_per_descriptor[descriptor]})")
+            for k, hits in k_hits_map.items():
+                recall = hits / query_counts_per_descriptor[descriptor]
+                final_recall_scores[descriptor][f"Recall@{k}"] = recall
+                print(f"     Recall@{k}: {recall:.4f}")
+                if wandb.run: wandb.summary[f"val_recall_at_{k}_desc_{descriptor.replace(' ', '_')}"] = recall
+        else:
+            print(f"   Descriptor: {descriptor} (Consultas: 0)")
+    print("--- Fin de Evaluación de Recall@k Específico por Descriptor ---")
+    return final_recall_scores
+
+
+def calculate_similarity(model, image_filename, text, image_base_path):
+    full_image_path = os.path.join(image_base_path, image_filename)
+    try:
+        embeddings = model.encode([text, full_image_path], convert_to_tensor=True)
+        text_embedding = embeddings[0].reshape(1, -1)
+        image_embedding = embeddings[1].reshape(1, -1)
+        similarity = util.pytorch_cos_sim(text_embedding, image_embedding)[0][0].item()
+        return similarity
+    except Exception as e:
+        print(f"Error en calculate_similarity para {full_image_path} y texto '{text}': {e}")
+        return 0.0
+
+def create_sentence_transformer_model(model_name_or_path):
+    print(f"Cargando modelo: {model_name_or_path}...")
+    model = SentenceTransformer(model_name_or_path)
+    return model
+
+def main():
+    wandb.init(
+        project="clip-finetuning-sangre-memoria", # Puedes cambiar el nombre del proyecto si quieres
+        config={
+            "model_name": MODEL_NAME,
+            "batch_size": BATCH_SIZE, # Recuerda que MNRL se beneficia de batches más grandes
+            "num_epochs": NUM_EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            # CAMBIO: Actualizar loss function
+            "loss_function": "MultipleNegativesRankingLoss",
+            # "contrastive_margin": CONTRASTIVE_MARGIN, # Ya no es necesario
+            "output_path": OUTPUT_PATH_NEW,
+            "train_csv": TRAIN_CSV,
+            "val_csv": VAL_CSV,
+            "image_base_path": IMAGE_BASE_PATH
+        }
+    )
+
+    train_csv_path = TRAIN_CSV
+    val_csv_path = VAL_CSV
+    test_csv_path = TEST_CSV
+    os.makedirs(OUTPUT_PATH_NEW, exist_ok=True)
+    dataset_dict = load_datasets(train_csv_path, val_csv_path, test_csv_path)
+
+    print("Preparando datos para el entrenamiento (MultipleNegativesRankingLoss)...")
+    # MODIFICADO: Solo pares positivos para el entrenamiento con MNRL
+    train_examples = create_training_examples(dataset_dict['train'], IMAGE_BASE_PATH, positive_pairs_only=True)
+
+    # Para EmbeddingSimilarityEvaluator, usamos todos los ejemplos con sus scores originales.
+    print("Preparando datos para EmbeddingSimilarityEvaluator (validación)...")
+    val_examples_for_emb_sim = create_training_examples(dataset_dict['valid'], IMAGE_BASE_PATH, positive_pairs_only=False)
+
+    print(f"Ejemplos de entrenamiento (solo positivos para MNRL): {len(train_examples)}")
+    if val_examples_for_emb_sim:
+        print(f"Ejemplos para EmbeddingSimilarityEvaluator (validación): {len(val_examples_for_emb_sim)}")
+
+
+    print("\nPreparando datos para InformationRetrievalEvaluator (validación)...")
+    # Asegúrate de que prepare_retrieval_eval_data use solo pares positivos para definir relevant_docs
+    val_queries, val_corpus, val_relevant_docs = prepare_retrieval_eval_data(dataset_dict['valid'], IMAGE_BASE_PATH)
+
+    dev_evaluator = None
+    if val_queries and val_corpus and val_relevant_docs:
+        dev_evaluator = evaluation.InformationRetrievalEvaluator(
+            queries=val_queries,
+            corpus=val_corpus,
+            relevant_docs=val_relevant_docs,
+            name='validation_retrieval',
+            precision_recall_at_k=[1, 3, 5, 10, 20],
+            show_progress_bar=True,
+            main_score_function = SimilarityFunction.COSINE # o 'dot_score'
+        )
+        print("InformationRetrievalEvaluator creado para validación durante entrenamiento.")
+    else:
+        print("No se creará InformationRetrievalEvaluator para validación (datos vacíos).")
+
+
+    model = create_sentence_transformer_model(MODEL_NAME)
+
+    # MODIFICADO: No se pasa contrastive_margin
+    if train_examples:
+        model = train_model(model, train_examples, dev_evaluator, NUM_EPOCHS, LEARNING_RATE, OUTPUT_PATH_NEW)
+    else:
+        print("No hay ejemplos de entrenamiento positivos. Saltando el paso de entrenamiento con MNRL.")
+
+
+    print("\n--- Iniciando Evaluaciones Post-Entrenamiento ---")
+    # Cargar el mejor modelo guardado por el entrenamiento
+    print(f"Cargando el mejor modelo desde: {OUTPUT_PATH_NEW if os.path.exists(OUTPUT_PATH_NEW) and os.listdir(OUTPUT_PATH_NEW) else MODEL_NAME}")
+    if os.path.exists(OUTPUT_PATH_NEW) and os.listdir(OUTPUT_PATH_NEW):
+        try:
+            model_fine_tuned = create_sentence_transformer_model(OUTPUT_PATH_NEW)
+        except Exception as e:
+            print(f"Error al cargar el modelo desde {OUTPUT_PATH_NEW}: {e}. Usando el modelo base {MODEL_NAME} en su lugar.")
+            model_fine_tuned = create_sentence_transformer_model(MODEL_NAME)
+    else:
+        print(f"No se encontró un modelo fine-tuneado en {OUTPUT_PATH_NEW}. Usando el modelo base {MODEL_NAME} para evaluación.")
+        model_fine_tuned = model
+
+
+    if val_examples_for_emb_sim:
+        print("\nEvaluando Similitud de Embeddings en Validation Set...")
+        evaluate_embedding_similarity(model_fine_tuned, val_examples_for_emb_sim, name='val_emb_sim')
+
+    df_val_pandas = dataset_dict['valid'].to_pandas()
+    evaluate_descriptor_specific_recall(model_fine_tuned, df_val_pandas, IMAGE_BASE_PATH)
+
+    print("\nPreparando datos para InformationRetrievalEvaluator (test)...")
+    test_queries, test_corpus, test_relevant_docs = prepare_retrieval_eval_data(dataset_dict['test'], IMAGE_BASE_PATH)
+    if test_queries and test_corpus and test_relevant_docs:
+        test_retrieval_evaluator = evaluation.InformationRetrievalEvaluator(
+            queries=test_queries,
+            corpus=test_corpus,
+            relevant_docs=test_relevant_docs,
+            name='test_retrieval',
+            precision_recall_at_k=[1, 3, 5, 10, 20],
+            show_progress_bar=True,
+        )
+        print("\nEvaluando Recuperación de Información en Test Set...")
+        test_retrieval_scores = test_retrieval_evaluator(model_fine_tuned, output_path=OUTPUT_PATH_NEW if os.path.exists(OUTPUT_PATH_NEW) else None)
+        if wandb.run:
+             if isinstance(test_retrieval_scores, dict):
+                for metric_name, metric_value in test_retrieval_scores.items(): # Los nombres ya incluyen el prefijo del evaluador
+                    wandb.summary[metric_name] = metric_value
+             elif isinstance(test_retrieval_scores, float):
+                wandb.summary["test_retrieval_score"] = test_retrieval_scores # Para evaluadores más simples
+    else:
+        print("No se realizará la evaluación de recuperación en Test Set debido a datos vacíos.")
+
+    if len(dataset_dict['test']) > 0:
+        example_image_filename = dataset_dict['test'][0]['image_path']
+        example_text = "Una célula con núcleo redondo"
+        similarity = calculate_similarity(model_fine_tuned, example_image_filename, example_text, IMAGE_BASE_PATH)
+        print(f"\nEjemplo de Similitud entre la imagen '{example_image_filename}' y el texto '{example_text}': {similarity:.4f}")
+
+    if wandb.run:
+        wandb.finish()
+    return model_fine_tuned
+
+if __name__ == "__main__":
+    try:
+        if wandb.run:
+            wandb.tensorboard.unpatch()
+    except AttributeError:
+        pass # wandb.run es None si no se ha llamado a init
+    except Exception as e:
+        print(f'Error al intentar wandb.tensorboard.unpatch(): {e}')
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Utilizando dispositivo: {device}")
+    model_result = main()
