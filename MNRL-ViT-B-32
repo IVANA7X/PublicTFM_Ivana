@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader
 import wandb
 
 # --- Configuración ---
-BATCH_SIZE = 16
-NUM_EPOCHS = 25 # Puedes ajustar esto según tus experimentos
+BATCH_SIZE = 32
+NUM_EPOCHS = 20 # Puedes ajustar esto según tus experimentos
 MODEL_NAME = "clip-ViT-B-32"
 LEARNING_RATE = 1e-5 # Configura tu learning rate deseado (ej. 2e-5, 1e-5, 3e-5)
 
@@ -329,7 +329,7 @@ def main():
             "batch_size": BATCH_SIZE,
             "num_epochs": NUM_EPOCHS,
             "learning_rate": LEARNING_RATE, # AÑADIDO LEARNING_RATE
-            "loss_function": "CosineSimilarityLoss",
+            "loss_function": "MultipleNegativesRankingLoss",
             "output_path": OUTPUT_PATH_NEW, # Usar nueva ruta
             "train_csv": TRAIN_CSV,
             "val_csv": VAL_CSV,
